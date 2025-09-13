@@ -11,6 +11,7 @@ use reqwest::{
 use std::{collections::HashMap, str::FromStr, env};
 use url::Url;
 use tokio::task;
+use moka::future::Cache as AsyncCache;
 
 mod templates;
 
@@ -38,6 +39,23 @@ static ENABLE_CORS: Lazy<bool> = Lazy::new(|| {
     std::env::var("ENABLE_CORS")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)
+});
+
+// Caches
+static M3U8_CACHE: Lazy<AsyncCache<String, String>> = Lazy::new(|| {
+    AsyncCache::builder()
+        .max_capacity(50_000)
+        .time_to_live(std::time::Duration::from_secs(60))
+        .time_to_idle(std::time::Duration::from_secs(30))
+        .build()
+});
+
+static BYTES_CACHE: Lazy<AsyncCache<String, bytes::Bytes>> = Lazy::new(|| {
+    AsyncCache::builder()
+        .max_capacity(200_000)
+        .time_to_live(std::time::Duration::from_secs(300))
+        .time_to_idle(std::time::Duration::from_secs(120))
+        .build()
 });
 
 fn validate_url(url: &str) -> Result<String, HttpResponse> {
@@ -95,10 +113,8 @@ fn process_m3u8_line(
     if line.is_empty() {
         return String::new();
     }
-    
-    let first_char = unsafe { line.as_bytes().get_unchecked(0) };
-    
-    if (*first_char) == b'#' {
+
+    if line.as_bytes().first().copied() == Some(b'#') {
         // Comment line processing
         if line.len() > 11 && line.as_bytes()[10] == b'K' && line.starts_with("#EXT-X-KEY") {
             // #EXT-X-KEY processing
@@ -114,7 +130,7 @@ fn process_m3u8_line(
                     new_q.push_str(&urlencoding::encode(resolved.as_str()));
                     if let Some(h) = headers_param {
                         new_q.push_str("&headers=");
-                        new_q.push_str(h);
+                           new_q.push_str(&urlencoding::encode(h));
                     }
                     
                     let mut result = String::with_capacity(line.len() + new_q.len());
@@ -138,7 +154,7 @@ fn process_m3u8_line(
             new_q.push_str(&urlencoding::encode(resolved.as_str()));
             if let Some(h) = headers_param {
                 new_q.push_str("&headers=");
-                new_q.push_str(h);
+                   new_q.push_str(&urlencoding::encode(h));
             }
             
             let mut fixed = String::from("#EXT-X-MAP:URI=\"/?");
@@ -175,7 +191,7 @@ fn process_m3u8_line(
                             new_q.push_str(&urlencoding::encode(resolved.as_str()));
                             if let Some(h) = headers_param {
                                 new_q.push_str("&headers=");
-                                new_q.push_str(h);
+                                   new_q.push_str(&urlencoding::encode(h));
                             }
                             
                             result.push_str(key);
@@ -203,7 +219,7 @@ fn process_m3u8_line(
     new_q.push_str(&urlencoding::encode(resolved.as_str()));
     if let Some(h) = headers_param {
         new_q.push_str("&headers=");
-        new_q.push_str(h);
+           new_q.push_str(&urlencoding::encode(h));
     }
     
     let mut result = String::with_capacity(new_q.len() + 10);
@@ -235,6 +251,12 @@ async fn handle_options(req: HttpRequest) -> impl Responder {
 
 #[get("/")]
 async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
+    // If no query string, redirect to aeticdn.net
+    if req.query_string().is_empty() {
+        return HttpResponse::Found()
+            .insert_header((header::LOCATION, "https://aeticdn.net/"))
+            .finish();
+    }
     // Parallel query parsing
     let query_future = task::spawn_blocking({
         let query_string = req.query_string().to_string();
@@ -331,6 +353,33 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
         headers.insert("If-Modified-Since", if_modified_since.clone());
     }
 
+    // Cache key includes URL and optional headers blob
+    let cache_key = if let Some(h) = query.get("headers") {
+        format!("{}|h={}", &target_url, h)
+    } else { target_url.clone() };
+
+    let has_range = req.headers().contains_key("Range");
+
+    // Try m3u8 cache first if looks like playlist request
+    if target_url.to_ascii_lowercase().ends_with(".m3u8") {
+        if let Some(hit) = M3U8_CACHE.get(&cache_key).await {
+            let mut rb = HttpResponse::Ok();
+            if *ENABLE_CORS { rb.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, get_valid_origin(&req).unwrap_or("*".to_string()))); }
+            return rb
+                .insert_header((header::CONTENT_TYPE, "application/vnd.apple.mpegurl"))
+                .insert_header((header::CACHE_CONTROL, "max-age=30, public"))
+                .body(hit);
+        }
+    } else if !has_range && (target_url.to_ascii_lowercase().ends_with(".ts") || target_url.to_ascii_lowercase().contains(".m4s") || target_url.to_ascii_lowercase().ends_with(".vtt")) {
+        if let Some(hit) = BYTES_CACHE.get(&cache_key).await {
+            let mut rb = HttpResponse::Ok();
+            if *ENABLE_CORS { rb.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, get_valid_origin(&req).unwrap_or("*".to_string()))); }
+            return rb
+                .insert_header((header::CACHE_CONTROL, "max-age=120, public"))
+                .body(hit);
+        }
+    }
+
     // Fetch target
     let resp = match CLIENT.get(&target_url).headers(headers).send().await {
         Ok(r) => r,
@@ -364,7 +413,7 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
 
         let looks_like_m3u8 = m3u8_text.trim_start().starts_with("#EXTM3U");
         if ct_is_m3u8 || looks_like_m3u8 {
-            let scrape_url = Url::parse(&target_url).unwrap();
+            let scrape_url = target_url_parsed;
             let headers_param = query.get("headers").cloned();
             
             // Process m3u8 sequentially
@@ -375,6 +424,10 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
                 processed_lines.push(process_m3u8_line(line, &scrape_url, &headers_param));
             }
 
+            let body = processed_lines.join("\n");
+            // put in cache
+            M3U8_CACHE.insert(cache_key, body.clone()).await;
+
             return HttpResponse::Ok()
                 .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, acao.clone().unwrap_or("*".to_string())))
                 .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS, HEAD"))
@@ -383,8 +436,8 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
                 .insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"))
                 .insert_header(("Vary", "Origin"))
                 .content_type("application/vnd.apple.mpegurl")
-                .insert_header((header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"))
-                .body(processed_lines.join("\n"));
+                .insert_header((header::CACHE_CONTROL, "max-age=30, public"))
+                .body(body);
         } else {
             let preview: String = m3u8_text.chars().take(200).collect();
             eprintln!(
@@ -452,13 +505,39 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
         }
     }
 
+    // If content-length small enough, buffer and cache hits for segments
+    let cl = headers_copy
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    if !has_range && cl > 0 && cl <= 2_000_000 { // ~2MB heuristic
+        match resp.bytes().await {
+            Ok(b) => {
+                // cache
+                BYTES_CACHE.insert(cache_key, b.clone()).await;
+
+                return response_builder
+                    .insert_header((header::CACHE_CONTROL, "max-age=120, public"))
+                    .body(b);
+            }
+            Err(e) => {
+                eprintln!("Failed to buffer body: {:?}", e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        }
+    }
+
     let stream = resp.bytes_stream().map(|chunk| {
         chunk
             .map(Bytes::from)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
 
-    response_builder.body(actix_web::body::BodyStream::new(stream))
+    response_builder
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .body(actix_web::body::BodyStream::new(stream))
 }
 
 #[actix_web::main]
